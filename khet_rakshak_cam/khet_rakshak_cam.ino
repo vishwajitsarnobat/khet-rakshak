@@ -1,8 +1,9 @@
 /*
   KHET-RAKSHAK bench prototype (ESP32-CAM, AI-Thinker)
-  PIR (GPIO13) -> photo -> Edge Impulse model -> buzzer + LED (GPIO12) if harmful
-  Every detection saved to SD (/det_xxxx.jpg) and logged to /log.csv
-  Footage test in Serial Monitor (115200), type the TRUE animal:
+  PIR (GPIO13) -> photo -> AI -> buzzer + LED (GPIO12) if harmful
+  Every detection: photo saved as <datetime>_<animal>.jpg + line in /log.csv
+  Real time from phone hotspot at boot (IST). No WiFi -> time since power-on.
+  Footage test (Serial Monitor 115200, No line ending), type TRUE animal:
     b = wild_boar, n = nilgai, m = monkey, d = deer, s = safe
 */
 #include <khet-rakshak_inferencing.h>
@@ -11,6 +12,12 @@
 #include "img_converters.h"
 #include "FS.h"
 #include "SD_MMC.h"
+#include <WiFi.h>
+#include "time.h"
+
+// ===== CHANGE THESE: your phone hotspot. if this is done timestamps will be proper while saving images =====
+const char *WIFI_SSID = "YOUR_HOTSPOT_NAME";
+const char *WIFI_PASS = "YOUR_HOTSPOT_PASSWORD";
 
 // AI-Thinker ESP32-CAM camera pins
 #define PWDN_GPIO_NUM  32
@@ -35,14 +42,39 @@
 
 #define CAP_W 320
 #define CAP_H 240
-const float THRESHOLD = 0.50;          // below this: logged as UNCERTAIN, no alarm
+const float THRESHOLD = 0.50;          // below this: UNCERTAIN, no alarm
 const uint32_t ALARM_MS = 3000;
 const uint32_t PIR_COOLDOWN_MS = 5000;
 
 static uint8_t *snapshot_buf = nullptr;
-static bool sd_ok = false;
+static bool sd_ok = false, time_ok = false;
 static uint32_t det_count = 0, test_total = 0, test_correct = 0, last_pir = 0;
 
+// ---------- time ----------
+void sync_time() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(19800, 0, "pool.ntp.org", "time.google.com");   // IST = UTC+5:30
+    struct tm t;
+    time_ok = getLocalTime(&t, 10000);
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);              // clock keeps running without WiFi
+  Serial.println(time_ok ? "Time synced (IST)" : "No WiFi: using time since power-on");
+}
+
+String now_str(bool for_file) {
+  if (!time_ok) return String(for_file ? "t" : "") + String(millis() / 1000) + (for_file ? "" : "s since start");
+  struct tm t;
+  getLocalTime(&t);
+  char b[24];
+  strftime(b, sizeof(b), for_file ? "%Y%m%d_%H%M%S" : "%Y-%m-%d %H:%M:%S", &t);
+  return String(b);
+}
+
+// ---------- camera ----------
 bool camera_init() {
   camera_config_t c = {};
   c.ledc_channel = LEDC_CHANNEL_0;  c.ledc_timer = LEDC_TIMER_0;
@@ -81,24 +113,21 @@ void log_line(const String &line) {
   if (f) { f.println(line); f.close(); }
 }
 
+// ---------- one detection ----------
 void detect(const char *source, const String &truth) {
   camera_fb_t *fb = esp_camera_fb_get();          // discard stale frame
   if (fb) esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
   if (!fb) { Serial.println("Camera capture failed"); return; }
-
+  String when = now_str(false);
+  String when_file = now_str(true);
   det_count++;
-  char path[32];
-  snprintf(path, sizeof(path), "/det_%04lu.jpg", (unsigned long)det_count);
-  if (sd_ok) {
-    File f = SD_MMC.open(path, FILE_WRITE);
-    if (f) { f.write(fb->buf, fb->len); f.close(); }
+
+  if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf)) {
+    esp_camera_fb_return(fb);
+    Serial.println("JPEG decode failed");
+    return;
   }
-
-  bool ok = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
-  esp_camera_fb_return(fb);
-  if (!ok) { Serial.println("JPEG decode failed"); return; }
-
   ei::image::processing::crop_and_interpolate_rgb888(
       snapshot_buf, CAP_W, CAP_H, snapshot_buf,
       EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
@@ -108,35 +137,45 @@ void detect(const char *source, const String &truth) {
   signal.get_data = &get_data;
   ei_impulse_result_t result = {0};
   uint32_t t0 = millis();
-  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) { Serial.println("Classifier failed"); return; }
+  if (run_classifier(&signal, &result, false) != EI_IMPULSE_OK) {
+    esp_camera_fb_return(fb);
+    Serial.println("Classifier failed");
+    return;
+  }
   uint32_t ms = millis() - t0;
 
-  const char *best = "";
-  float best_v = 0;
+  const char *animal = "";
+  float conf = 0;
   for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    if (result.classification[i].value > best_v) {
-      best_v = result.classification[i].value;
-      best = result.classification[i].label;
+    if (result.classification[i].value > conf) {
+      conf = result.classification[i].value;
+      animal = result.classification[i].label;
     }
   }
-  bool uncertain = best_v < THRESHOLD;
-  bool harmful = strcmp(best, "safe") != 0 && !uncertain;
+  bool uncertain = conf < THRESHOLD;
+  bool harmful = strcmp(animal, "safe") != 0 && !uncertain;
+  const char *harm_txt = harmful ? "YES" : (uncertain ? "UNCERTAIN" : "NO");
+
+  // save photo named by time + animal
+  String photo = "/" + when_file + "_" + animal + ".jpg";
+  if (sd_ok) {
+    File f = SD_MMC.open(photo.c_str(), FILE_WRITE);
+    if (f) { f.write(fb->buf, fb->len); f.close(); }
+  }
+  esp_camera_fb_return(fb);
 
   String correct = "";
   if (truth.length()) {
     test_total++;
-    bool right = truth.equals(best);
+    bool right = truth.equals(animal);
     if (right) test_correct++;
     correct = right ? "YES" : "NO";
   }
-  float acc = test_total ? 100.0f * test_correct / test_total : 0;
+  String acc = test_total ? String(100.0f * test_correct / test_total, 1) : "";
 
-  // no,time_s,source,true_label,predicted,confidence,correct,alarm,infer_ms,photo,running_acc
-  String line = String(det_count) + "," + String(millis() / 1000) + "," + source + "," + truth + "," +
-                best + "," + String(best_v, 2) + "," + correct + "," +
-                (harmful ? "ALARM" : (uncertain ? "UNCERTAIN" : "-")) + "," +
-                String(ms) + "," + path + "," + (test_total ? String(acc, 1) : "");
-  log_line(line);
+  // date_time,trigger,animal_detected,harmful,confidence,photo,true_label,correct,running_acc,ai_ms
+  log_line(when + "," + source + "," + animal + "," + harm_txt + "," + String(conf, 2) + "," +
+           photo + "," + truth + "," + correct + "," + acc + "," + String(ms));
 
   if (harmful) {
     digitalWrite(ALARM_PIN, HIGH);
@@ -155,11 +194,13 @@ void setup() {
   snapshot_buf = (uint8_t *)ps_malloc(CAP_W * CAP_H * 3);
   if (!snapshot_buf) { Serial.println("No PSRAM: enable PSRAM in Tools menu"); while (true) delay(1000); }
 
+  sync_time();
+
   sd_ok = SD_MMC.begin("/sdcard", true);   // 1-bit mode keeps GPIO12/13 free
   Serial.println(sd_ok ? "SD card OK" : "SD card not found (continuing without saving)");
   if (sd_ok && !SD_MMC.exists("/log.csv")) {
     File f = SD_MMC.open("/log.csv", FILE_WRITE);
-    if (f) { f.println("no,time_s,source,true_label,predicted,confidence,correct,alarm,infer_ms,photo,running_acc"); f.close(); }
+    if (f) { f.println("date_time,trigger,animal_detected,harmful,confidence,photo,true_label,correct,running_acc,ai_ms"); f.close(); }
   }
   Serial.println("KHET-RAKSHAK ready. Type b/n/m/d/s for a footage test, or wave at the PIR.");
   delay(2000);
